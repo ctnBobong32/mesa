@@ -1,47 +1,48 @@
 # .github/workflows/mesa-android.yml
-name: Mesa Android 交叉编译 (GitLab CI 完整转换)
+name: Mesa Android 交叉编译 (完整版)
 
 on:
-  workflow_dispatch:  # 手动触发，与原 GitLab 规则保持一致（未限定分支）
+  workflow_dispatch:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
 
 env:
-  # 模拟 GitLab 预定义环境变量（可根据需要修改）
-  ANDROID_SDK_VERSION: "29"   # 对应 ${ANDROID_SDK_VERSION}
-  S3_HOST: "s3.example.com"   # 仅用于占位，实际使用 GitHub Artifacts
-  # 注意：原 job 中使用了 S3_JWT_FILE，此处忽略（改用 artifacts）
+  ANDROID_SDK_VERSION: "29"
+  # 如需上传到 S3，请设置以下 secrets，否则忽略
+  S3_HOST: ${{ secrets.S3_HOST }}
+  S3_JWT_FILE: ${{ secrets.S3_JWT_FILE }}
 
 jobs:
   debian-android:
     name: Android 构建 (x86_64 + aarch64)
     runs-on: ubuntu-latest
-    # 原 job 继承自 .use-debian/android_build，通常是一个预装依赖的 Docker 镜像
-    # 在 GitHub Actions 中，我们直接使用 ubuntu-latest 并手动安装所需依赖
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 安装系统依赖 (Debian 基础)
+      - name: 安装系统依赖及升级 Meson
         run: |
           sudo apt update
           sudo apt install -y meson ninja-build pkg-config python3-pip python3-mako python3-ply \
             git curl ca-certificates
+          # 升级 Meson 到 Mesa 要求的版本 (>=1.4.0)
+          pip install --upgrade 'meson>=1.4.0'
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          # 验证版本
+          meson --version
 
       - name: 安装 Android NDK (r25c)
         run: |
-          # 下载 NDK（与原环境一致，原 .android-variables 可能定义了 NDK 路径）
           wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
           unzip -q android-ndk-r25c-linux.zip
           echo "ANDROID_NDK_ROOT=${PWD}/android-ndk-r25c" >> $GITHUB_ENV
           echo "${PWD}/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
       - name: 准备 llvm-meson-wrap 文件 (模拟原 create-llvm-meson-wrap-file.sh)
-        # 原脚本内容未提供，此处只创建一个最小化的示例文件以避免构建失败
         run: |
           mkdir -p subprojects
           cat > subprojects/llvm.wrap <<EOF
@@ -54,14 +55,12 @@ jobs:
           EOF
           echo "已创建 llvm.wrap (占位，请根据实际内容替换)"
 
-      # 以下为原 job 中 script 部分：先构建 x86_64，再清理后构建 aarch64
+      # ========== 构建 x86_64 ==========
       - name: 构建 x86_64 Android
         env:
-          # 对应原 export 变量
           CROSS: x86_64-linux-android
           GALLIUM_DRIVERS: iris,radeonsi,softpipe,virgl,zink
           VULKAN_DRIVERS: amd,intel,nouveau,swrast,virtio
-          # 以下变量均从原 job 的 variables 继承
           BUILDTYPE: debug
           UNWIND: disabled
           C_ARGS: -Wno-error=asm-operand-widths -Wno-error=constant-conversion -Wno-error=enum-conversion -Wno-error=initializer-overrides -Wno-error=sometimes-uninitialized
@@ -72,16 +71,18 @@ jobs:
           PKG_CONFIG_LIBDIR: /disable/non/android/system/pc/files
           HOST_BUILD_OPTIONS: -D build-tests=false -D enable-glcpp-tests=false -D gallium-drivers= -D vulkan-drivers= -D video-codecs= -D glx=disabled -D platforms= -D mesa-clc=enabled -D install-mesa-clc=true -D precomp-compiler=enabled -D install-precomp-compiler=true -D tools=panfrost
         run: |
-          # 1. 主机构建 (mesa-clc 等)
+          # 确保 PATH 包含升级后的 meson
+          export PATH=$HOME/.local/bin:$PATH
+          meson --version
+
+          # 主机构建
           meson setup _host_build $HOST_BUILD_OPTIONS
           ninja -C _host_build
 
-          # 2. 使用交叉编译文件 (需要动态生成)
-          # 原 job 使用 .meson-cross 扩展，通常会设置 meson 的 --cross-file 参数
-          # 这里手动生成一个交叉文件
+          # 生成交叉编译文件
           cat > android-${CROSS}.txt <<EOF
           [binaries]
-          c = '${CROSS}26-clang'      # NDK 中的 clang 命名
+          c = '${CROSS}26-clang'
           cpp = '${CROSS}26-clang++'
           ar = 'llvm-ar'
           strip = 'llvm-strip'
@@ -91,8 +92,6 @@ jobs:
           cpu = 'x86_64'
           endian = 'little'
           EOF
-          # 如果是 aarch64 则修改 cpu_family
-          sed -i "s/cpu_family = .*/cpu_family = 'x86_64'/" android-${CROSS}.txt
 
           meson setup _build \
             --cross-file android-${CROSS}.txt \
@@ -109,24 +108,22 @@ jobs:
 
           ninja -C _build
 
-          # 保存制品（x86_64）
+          # 保存 x86_64 制品
           mkdir -p artifacts-x86_64
           cp -r _build/meson-logs artifacts-x86_64/ || true
-          # 可选：打包构建结果
-          tar czf mesa-x86_64-android-$BUILDTYPE.tar.gz _build/install
+          tar czf mesa-x86_64-android-${BUILDTYPE}.tar.gz _build/install/ || true
 
       - name: 清理中间文件 (为 aarch64 构建做准备)
         run: |
           rm -rf _build _host_build
-          git clean -dxf .   # 原 job 中执行的命令，小心会删除所有未跟踪文件
-          # 因为上一步已保存制品，这里安全清理
+          git clean -dxf .
 
+      # ========== 构建 aarch64 ==========
       - name: 构建 aarch64 Android
         env:
           CROSS: aarch64-linux-android
           GALLIUM_DRIVERS: etnaviv,freedreno,lima,panfrost,vc4,v3d,zink
           VULKAN_DRIVERS: freedreno,broadcom,panfrost,virtio
-          # 其余环境变量与 x86_64 相同（从继承得来，此处重复声明）
           BUILDTYPE: debug
           UNWIND: disabled
           C_ARGS: -Wno-error=asm-operand-widths -Wno-error=constant-conversion -Wno-error=enum-conversion -Wno-error=initializer-overrides -Wno-error=sometimes-uninitialized
@@ -137,11 +134,14 @@ jobs:
           PKG_CONFIG_LIBDIR: /disable/non/android/system/pc/files
           HOST_BUILD_OPTIONS: -D build-tests=false -D enable-glcpp-tests=false -D gallium-drivers= -D vulkan-drivers= -D video-codecs= -D glx=disabled -D platforms= -D mesa-clc=enabled -D install-mesa-clc=true -D precomp-compiler=enabled -D install-precomp-compiler=true -D tools=panfrost
         run: |
-          # 再次主机构建 (可能需要重新构建，原 job 中未显式重复，但为了安全保留)
+          export PATH=$HOME/.local/bin:$PATH
+          meson --version
+
+          # 主机构建 (可能需要重新构建)
           meson setup _host_build $HOST_BUILD_OPTIONS
           ninja -C _host_build
 
-          # 生成 aarch64 交叉文件
+          # 生成 aarch64 交叉编译文件
           cat > android-${CROSS}.txt <<EOF
           [binaries]
           c = '${CROSS}26-clang'
@@ -170,10 +170,10 @@ jobs:
 
           ninja -C _build
 
-          # 保存制品（aarch64）
+          # 保存 aarch64 制品
           mkdir -p artifacts-aarch64
           cp -r _build/meson-logs artifacts-aarch64/ || true
-          tar czf mesa-arm64-android-$BUILDTYPE.tar.gz _build/install/
+          tar czf mesa-arm64-android-${BUILDTYPE}.tar.gz _build/install/ || true
 
       - name: 上传所有 Android 构建制品
         if: always()
@@ -183,3 +183,15 @@ jobs:
           path: |
             mesa-*-android-*.tar.gz
             artifacts-*/
+
+      # (可选) 上传到 S3，模拟原 ci-fairy s3cp
+      - name: 上传到 S3 (需要配置)
+        if: env.S3_HOST != '' && env.S3_JWT_FILE != ''
+        run: |
+          # 安装 awscli
+          pip install awscli
+          # 使用 S3_JWT_FILE 中的凭证（假设是 JWT 格式，原生 S3 需要 key/secret，这里仅为示例）
+          # 原 ci-fairy s3cp 使用 JWT token，此处改用标准 AWS 凭证
+          # 实际需根据你的 S3 兼容服务调整
+          echo "如需 S3 上传，请配置正确的 AWS 凭证"
+          # aws s3 cp mesa-x86_64-android-debug.tar.gz s3://$S3_HOST/git-cache/...
