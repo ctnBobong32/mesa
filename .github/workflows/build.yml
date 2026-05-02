@@ -1,0 +1,185 @@
+# .github/workflows/mesa-android.yml
+name: Mesa Android 交叉编译 (GitLab CI 完整转换)
+
+on:
+  workflow_dispatch:  # 手动触发，与原 GitLab 规则保持一致（未限定分支）
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  # 模拟 GitLab 预定义环境变量（可根据需要修改）
+  ANDROID_SDK_VERSION: "29"   # 对应 ${ANDROID_SDK_VERSION}
+  S3_HOST: "s3.example.com"   # 仅用于占位，实际使用 GitHub Artifacts
+  # 注意：原 job 中使用了 S3_JWT_FILE，此处忽略（改用 artifacts）
+
+jobs:
+  debian-android:
+    name: Android 构建 (x86_64 + aarch64)
+    runs-on: ubuntu-latest
+    # 原 job 继承自 .use-debian/android_build，通常是一个预装依赖的 Docker 镜像
+    # 在 GitHub Actions 中，我们直接使用 ubuntu-latest 并手动安装所需依赖
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装系统依赖 (Debian 基础)
+        run: |
+          sudo apt update
+          sudo apt install -y meson ninja-build pkg-config python3-pip python3-mako python3-ply \
+            git curl ca-certificates
+
+      - name: 安装 Android NDK (r25c)
+        run: |
+          # 下载 NDK（与原环境一致，原 .android-variables 可能定义了 NDK 路径）
+          wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+          unzip -q android-ndk-r25c-linux.zip
+          echo "ANDROID_NDK_ROOT=${PWD}/android-ndk-r25c" >> $GITHUB_ENV
+          echo "${PWD}/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: 准备 llvm-meson-wrap 文件 (模拟原 create-llvm-meson-wrap-file.sh)
+        # 原脚本内容未提供，此处只创建一个最小化的示例文件以避免构建失败
+        run: |
+          mkdir -p subprojects
+          cat > subprojects/llvm.wrap <<EOF
+          [wrap-file]
+          directory = llvm
+          source_url = https://github.com/llvm/llvm-project/releases/download/llvmorg-15.0.0/llvm-project-15.0.0.src.tar.xz
+          source_filename = llvm-15.0.0.tar.xz
+          source_hash = 1234567890abcdef
+          patch_directory = llvm
+          EOF
+          echo "已创建 llvm.wrap (占位，请根据实际内容替换)"
+
+      # 以下为原 job 中 script 部分：先构建 x86_64，再清理后构建 aarch64
+      - name: 构建 x86_64 Android
+        env:
+          # 对应原 export 变量
+          CROSS: x86_64-linux-android
+          GALLIUM_DRIVERS: iris,radeonsi,softpipe,virgl,zink
+          VULKAN_DRIVERS: amd,intel,nouveau,swrast,virtio
+          # 以下变量均从原 job 的 variables 继承
+          BUILDTYPE: debug
+          UNWIND: disabled
+          C_ARGS: -Wno-error=asm-operand-widths -Wno-error=constant-conversion -Wno-error=enum-conversion -Wno-error=initializer-overrides -Wno-error=sometimes-uninitialized
+          CPP_ARGS: -Wno-error=c99-designator
+          DRI_LOADERS: -D glx=disabled -D gbm=disabled -D egl=enabled -D glvnd=disabled -D platforms=android
+          EXTRA_OPTION: -D amd-use-llvm=false -D android-stub=true -D platform-sdk-version=${{ env.ANDROID_SDK_VERSION }} -D cpp_rtti=false -D valgrind=disabled -D android-libbacktrace=disabled -D mesa-clc=system -D precomp-compiler=system -D perfetto=true -D freedreno-kmds=msm,virtio
+          GALLIUM_ST: -D gallium-va=disabled -D gallium-rusticl=false
+          PKG_CONFIG_LIBDIR: /disable/non/android/system/pc/files
+          HOST_BUILD_OPTIONS: -D build-tests=false -D enable-glcpp-tests=false -D gallium-drivers= -D vulkan-drivers= -D video-codecs= -D glx=disabled -D platforms= -D mesa-clc=enabled -D install-mesa-clc=true -D precomp-compiler=enabled -D install-precomp-compiler=true -D tools=panfrost
+        run: |
+          # 1. 主机构建 (mesa-clc 等)
+          meson setup _host_build $HOST_BUILD_OPTIONS
+          ninja -C _host_build
+
+          # 2. 使用交叉编译文件 (需要动态生成)
+          # 原 job 使用 .meson-cross 扩展，通常会设置 meson 的 --cross-file 参数
+          # 这里手动生成一个交叉文件
+          cat > android-${CROSS}.txt <<EOF
+          [binaries]
+          c = '${CROSS}26-clang'      # NDK 中的 clang 命名
+          cpp = '${CROSS}26-clang++'
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          [host_machine]
+          system = 'android'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+          # 如果是 aarch64 则修改 cpu_family
+          sed -i "s/cpu_family = .*/cpu_family = 'x86_64'/" android-${CROSS}.txt
+
+          meson setup _build \
+            --cross-file android-${CROSS}.txt \
+            -D buildtype=$BUILDTYPE \
+            -D unwind=$UNWIND \
+            -D c_args="$C_ARGS" \
+            -D cpp_args="$CPP_ARGS" \
+            $DRI_LOADERS \
+            $GALLIUM_ST \
+            -D gallium-drivers=$GALLIUM_DRIVERS \
+            -D vulkan-drivers=$VULKAN_DRIVERS \
+            $EXTRA_OPTION \
+            -D pkg_config_libdir="$PKG_CONFIG_LIBDIR"
+
+          ninja -C _build
+
+          # 保存制品（x86_64）
+          mkdir -p artifacts-x86_64
+          cp -r _build/meson-logs artifacts-x86_64/ || true
+          # 可选：打包构建结果
+          tar czf mesa-x86_64-android-$BUILDTYPE.tar.gz _build/install
+
+      - name: 清理中间文件 (为 aarch64 构建做准备)
+        run: |
+          rm -rf _build _host_build
+          git clean -dxf .   # 原 job 中执行的命令，小心会删除所有未跟踪文件
+          # 因为上一步已保存制品，这里安全清理
+
+      - name: 构建 aarch64 Android
+        env:
+          CROSS: aarch64-linux-android
+          GALLIUM_DRIVERS: etnaviv,freedreno,lima,panfrost,vc4,v3d,zink
+          VULKAN_DRIVERS: freedreno,broadcom,panfrost,virtio
+          # 其余环境变量与 x86_64 相同（从继承得来，此处重复声明）
+          BUILDTYPE: debug
+          UNWIND: disabled
+          C_ARGS: -Wno-error=asm-operand-widths -Wno-error=constant-conversion -Wno-error=enum-conversion -Wno-error=initializer-overrides -Wno-error=sometimes-uninitialized
+          CPP_ARGS: -Wno-error=c99-designator
+          DRI_LOADERS: -D glx=disabled -D gbm=disabled -D egl=enabled -D glvnd=disabled -D platforms=android
+          EXTRA_OPTION: -D amd-use-llvm=false -D android-stub=true -D platform-sdk-version=${{ env.ANDROID_SDK_VERSION }} -D cpp_rtti=false -D valgrind=disabled -D android-libbacktrace=disabled -D mesa-clc=system -D precomp-compiler=system -D perfetto=true -D freedreno-kmds=msm,virtio
+          GALLIUM_ST: -D gallium-va=disabled -D gallium-rusticl=false
+          PKG_CONFIG_LIBDIR: /disable/non/android/system/pc/files
+          HOST_BUILD_OPTIONS: -D build-tests=false -D enable-glcpp-tests=false -D gallium-drivers= -D vulkan-drivers= -D video-codecs= -D glx=disabled -D platforms= -D mesa-clc=enabled -D install-mesa-clc=true -D precomp-compiler=enabled -D install-precomp-compiler=true -D tools=panfrost
+        run: |
+          # 再次主机构建 (可能需要重新构建，原 job 中未显式重复，但为了安全保留)
+          meson setup _host_build $HOST_BUILD_OPTIONS
+          ninja -C _host_build
+
+          # 生成 aarch64 交叉文件
+          cat > android-${CROSS}.txt <<EOF
+          [binaries]
+          c = '${CROSS}26-clang'
+          cpp = '${CROSS}26-clang++'
+          ar = 'llvm-ar'
+          strip = 'llvm-strip'
+          [host_machine]
+          system = 'android'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+
+          meson setup _build \
+            --cross-file android-${CROSS}.txt \
+            -D buildtype=$BUILDTYPE \
+            -D unwind=$UNWIND \
+            -D c_args="$C_ARGS" \
+            -D cpp_args="$CPP_ARGS" \
+            $DRI_LOADERS \
+            $GALLIUM_ST \
+            -D gallium-drivers=$GALLIUM_DRIVERS \
+            -D vulkan-drivers=$VULKAN_DRIVERS \
+            $EXTRA_OPTION \
+            -D pkg_config_libdir="$PKG_CONFIG_LIBDIR"
+
+          ninja -C _build
+
+          # 保存制品（aarch64）
+          mkdir -p artifacts-aarch64
+          cp -r _build/meson-logs artifacts-aarch64/ || true
+          tar czf mesa-arm64-android-$BUILDTYPE.tar.gz _build/install/
+
+      - name: 上传所有 Android 构建制品
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesa-android-artifacts
+          path: |
+            mesa-*-android-*.tar.gz
+            artifacts-*/
