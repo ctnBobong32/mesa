@@ -1,0 +1,82 @@
+name: 从 GitLab 同步 Mesa 到 GitHub
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '要同步的分支（留空则使用上游默认分支）'
+        required: false
+        default: ''
+        type: string
+      clone_depth:
+        description: '克隆深度（1 = 仅最新提交，full = 完整历史）'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - 'full'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出目标仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 备份 .github 目录
+        run: |
+          if [ -d ".github" ]; then
+            cp -r .github ../github-backup
+          fi
+
+      - name: 获取上游默认分支
+        id: get_default_branch
+        run: |
+          git ls-remote --symref https://gitlab.freedesktop.org/mesa/mesa.git HEAD \
+            | awk '/ref: refs\/heads\// {gsub("ref: refs/heads/", ""); print $2}' \
+            > upstream_default_branch.txt
+          echo "default_branch=$(cat upstream_default_branch.txt)" >> $GITHUB_OUTPUT
+
+      - name: 确定目标分支
+        id: target_branch
+        run: |
+          if [ -z "${{ github.event.inputs.branch }}" ]; then
+            BRANCH="${{ steps.get_default_branch.outputs.default_branch }}"
+          else
+            BRANCH="${{ github.event.inputs.branch }}"
+          fi
+          echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
+
+      - name: 添加上游仓库并同步
+        run: |
+          git remote add upstream https://gitlab.freedesktop.org/mesa/mesa.git
+          DEPTH_FLAG=""
+          if [ "${{ github.event.inputs.clone_depth }}" = "1" ]; then
+            DEPTH_FLAG="--depth=1"
+          fi
+          git fetch upstream ${{ steps.target_branch.outputs.branch }} ${DEPTH_FLAG}
+          git reset --hard upstream/${{ steps.target_branch.outputs.branch }}
+          git clean -fd
+
+      - name: 恢复 .github 目录
+        run: |
+          if [ -d "../github-backup" ]; then
+            rm -rf .github
+            cp -r ../github-backup .github
+            rm -rf ../github-backup
+          fi
+
+      - name: 提交并强制推送
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: 同步 Mesa 上游 (${{ steps.target_branch.outputs.branch }}) $(date -u +'%Y-%m-%d %H:%M:%S')" || echo "无变化"
+          git push --force origin HEAD:${{ github.ref_name }}
